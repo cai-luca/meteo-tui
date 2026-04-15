@@ -4,7 +4,7 @@ Questa applicazione recupera i dati meteorologici in tempo reale utilizzando l'A
 
 ## 🌟 Panoramica del Progetto
 
-**Meteo TUI** è uno strumento leggero e veloce per consultare il meteo dal terminale. Supporta sia una modalità interattiva (TUI) che una modalità di avvio rapido (CLI). Il progetto è documentato in dettaglio nel file [presentazione.md](file:///Users/zyaen/Desktop/meteo%20AI/presentazione.md).
+**Meteo TUI** è uno strumento leggero e veloce per consultare il meteo dal terminale. Supporta sia una modalità interattiva (TUI) che una modalità di avvio rapido (CLI). Il progetto è documentato in dettaglio nel file [presentazione.md](presentazione.md).
 
 ## 🛠️ Navigazione ed Esecuzione
 
@@ -60,6 +60,7 @@ Esegui l'app senza parametri per entrare nella modalità grafica con i tuoi pref
 ```bash
 go run main.go --refresh 15
 ```
+- `--refresh 0` disabilita l’aggiornamento automatico. Valori negativi vengono trattati come `0`.
 - Usa le **frecce** per navigare tra i risultati.
 - Premi **Enter** per aggiungere una città alla lista di monitoraggio temporanea.
 - Premi **Ctrl+S** per salvare esplicitamente la lista attuale nei preferiti (file `favoriteCities`).
@@ -71,9 +72,10 @@ go run main.go --refresh 15
 
 ## ✨ Funzionalità Avanzate
 
-- 🗄️ **SQLite Cache**: Tutte le richieste API sono memorizzate in `meteo.db` per 15 minuti, garantendo velocità e risparmio dati.
-- 🔄 **Auto-Refresh**: La TUI si aggiorna automaticamente ogni N minuti (configurabile con `--refresh`).
-- 📌 **Preferiti Persistenti**: Le città monitorate vengono salvate con le loro coordinate per evitare ricerche ridondanti.
+- 🗄️ **SQLite Cache**: Le risposte API vengono memorizzate in `meteo.db` con TTL per chiave: circa **15 minuti** per il meteo e **24 ore** per la geocodifica. Inoltre, le righe più vecchie di **7 giorni** vengono rimosse all’avvio e poi **ogni ora** (pulizia globale), così il file non cresce indefinitamente. Una riga con JSON **non decodificabile** viene eliminata così al prossimo fetch la cache si ricostruisce.
+- 🔁 **Retry (TUI)**: In modalità interattiva, il caricamento del meteo per una città usa fino a **3 tentativi** con attese progressive tra un tentativo e l’altro, entro un budget di timeout sul contesto (vedi `fetchWeather` in `main.go`). La Quick Launch CLI usa ancora una singola chiamata senza retry.
+- 🔄 **Auto-Refresh**: La TUI si aggiorna automaticamente ogni N minuti (configurabile con `--refresh`). Se un ciclo di refresh è ancora in corso quando scatta il tick successivo, quel tick viene **saltato** per evitare richieste sovrapposte alla rete.
+- 📌 **Preferiti Persistenti**: Le città monitorate vengono salvate con le loro coordinate per evitare ricerche ridondanti. Se il file JSON dei preferiti è **illeggibile o corrotto**, viene rinominato aggiungendo il suffisso `.corrupted` al percorso configurato (`METEO_FAVORITES_PATH`, default `./favoriteCities`) e l’app parte senza preferiti finché non salvi di nuovo.
 - 📅 **GUI Evoluta**: Layout con `BIG_view` per i dettagli e `LittleView` per le previsioni a 5 giorni.
 - 🌍 **Localizzazione Automatica**: Supporto per **Italiano** e **Inglese**. L'app rileva la lingua tramite la variabile d'ambiente `$LANG`.
 
@@ -86,8 +88,8 @@ L'app utilizza le API di **[Open-Meteo](https://open-meteo.com/)**. Nessuna chia
 La sicurezza e la privacy degli utenti sono una priorità per questo progetto:
 
 - **Gestione Dati Sensibili**: L'applicazione non richiede né memorizza chiavi API o password.
-- **Sanificazione Input**: Tutti gli input dell'utente (nomi delle città) vengono puliti e sanificati per prevenire manipolazioni improprie.
-- **Parametrizzazione SQL**: Tutte le query al database SQLite utilizzano parametri (prepared statements) per eliminare il rischio di SQL Injection.
+- **Sanificazione Input**: I nomi delle città vengono normalizzati (`TrimSpace`), troncati a una lunghezza massima e privati di caratteri non adatti al contesto (es. simboli tipo `<>[]{}"` ecc.), per ridurre input anomali o rumorosi.
+- **Parametrizzazione SQL**: Tutte le query al database SQLite usano **placeholder `?`** con valori passati separatamente (`database/sql`), eliminando il rischio di SQL injection da concatenazione di stringhe. Non è obbligatorio usare `Prepare()` esplicito per ottenere questo effetto.
 - **Configurazione Sicura**: I percorsi del database e dei preferiti possono essere configurati tramite variabili d'ambiente:
   - `METEO_DB_PATH`: Percorso del file di cache SQLite (default: `./meteo.db`).
   - `METEO_FAVORITES_PATH`: Percorso del file dei preferiti (default: `./favoriteCities`).

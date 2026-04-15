@@ -1,3 +1,5 @@
+documento generato con PANDOC, vedi file originale con GIF ANIMATE qui: https://github.com/cai-luca/meteo-tui/blob/main/presentazione.md
+
 # Presentazione del Progetto: Meteo TUI
 
 ## Riassunto del Progetto

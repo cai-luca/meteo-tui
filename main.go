@@ -3,15 +3,16 @@ Meteo TUI - Un'applicazione meteorologica professionale per terminale in Go.
 
 Caratteristiche Principali (Advanced Features):
 - Integrazione API Open-Meteo per dati in tempo reale e geocodifica.
-- Caching intelligente tramite SQLite per minimizzare il traffico di rete (TTL 15min per meteo, 24h per città).
+- Caching tramite SQLite: TTL per chiave (meteo ~15 min, geocodifica ~24 h), purge globale delle righe più vecchie di 7 giorni all'avvio e ogni ora.
+- In TUI, recupero meteo con retry (fino a 3 tentativi con backoff) entro un timeout sul context.
 - Interfaccia utente avanzata (Bubble Tea/Lip Gloss) con layout adattivo (BIG_view e LittleView).
-- Monitoraggio multi-città e preferiti persistenti.
+- Monitoraggio multi-città e preferiti persistenti; file preferiti corrotto rinominato con suffisso .corrupted.
 - Localizzazione automatica (IT/EN) basata sul sistema.
 
 Sicurezza ed Etica (Security & Ethics):
 - Utilizzo responsabile di API pubbliche senza necessità di chiavi segrete.
-- Sanificazione rigorosa di tutti gli input utente per prevenire manipolazioni di path o buffer.
-- Prevenzione SQL Injection tramite l'uso esclusivo di prepared statements (parametri '?').
+- Sanificazione degli input (trim, lunghezza massima, rimozione caratteri non adatti ai nomi città).
+- Prevenzione SQL Injection: query parametrizzate con placeholder '?' e argomenti separati (database/sql).
 - Privacy-first: Nessun dato utente viene inviato a terze parti (eccetto le coordinate per l'API meteo).
 - Codice documentato e conforme alle licenze open source delle dipendenze (MIT/BSD).
 */
@@ -29,6 +30,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -117,12 +119,14 @@ type model struct {
 	pinnedIdx    int // Indice della città monitorata visualizzata in BIG_view
 	selectedDay  int // 0 per oggi, 1-3 per previsioni
 	statusMsg    string
-	statusTimer  *time.Timer
+	statusMsgID  int
 	err          error
 	loading      bool
 	lastSearch   string
 	searchTimer  *time.Timer
 	refreshMin   int
+	refreshing   bool
+	refreshJobs  int
 }
 
 // Messaggi personalizzati per la gestione dello stato in Bubble Tea.
@@ -133,7 +137,9 @@ type gotWeatherMsg struct {
 }
 type errMsg error
 type searchMsg string
-type clearStatusMsg struct{}
+type clearStatusMsg struct {
+	id int
+}
 
 // initialModel crea lo stato iniziale dell'applicazione.
 func initialModel() model {
@@ -178,6 +184,8 @@ var (
 	userLang         = "en" // Default
 )
 
+var dangerousPattern = regexp.MustCompile(`[<>{}\[\]$@%&;'"\\]`)
+
 // getEnv restituisce il valore di una variabile d'ambiente o un valore di default.
 func getEnv(key, defaultValue string) string {
 	if value, exists := os.LookupEnv(key); exists {
@@ -186,7 +194,8 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
-// sanitizeInput pulisce e valida l'input dell'utente per prevenire manipolazioni.
+// sanitizeInput normalizza l'input per la ricerca città: TrimSpace, limite di lunghezza e rimozione
+// di caratteri non adatti (vedi dangerousPattern), per ridurre input anomali o rumorosi.
 func sanitizeInput(input string) string {
 	// Rimuove spazi bianchi all'inizio e alla fine
 	trimmed := strings.TrimSpace(input)
@@ -194,9 +203,8 @@ func sanitizeInput(input string) string {
 	if len(trimmed) > 100 {
 		trimmed = trimmed[:100]
 	}
-	// Permette solo caratteri alfanumerici, spazi, trattini e apostrofi (comuni nei nomi di città)
-	// In un'app reale più complessa, useremmo regex più sofisticate o librerie di validazione.
-	return trimmed
+	// Rimuove caratteri che non hanno senso nel contesto città e potrebbero sporcare query/log.
+	return dangerousPattern.ReplaceAllString(trimmed, "")
 }
 
 type translations struct {
@@ -296,6 +304,8 @@ const (
 	dailyParams   = "weather_code,temperature_2m_max,temperature_2m_min,relative_humidity_2m_max,precipitation_sum"
 )
 
+// initDB apre SQLite, crea la tabella cache se assente ed esegue subito una pulizia delle entry
+// più vecchie della finestra globale (7 giorni). La pulizia periodica è avviata da startCacheCleaner.
 func initDB() {
 	var err error
 	db, err = sql.Open("sqlite", dbPath)
@@ -313,6 +323,8 @@ func initDB() {
 	if err != nil {
 		log.Fatalf("Errore creazione tabella cache: %v", err)
 	}
+
+	cleanExpiredCache()
 }
 
 func saveToCache(key string, data interface{}) {
@@ -327,6 +339,8 @@ func saveToCache(key string, data interface{}) {
 	}
 }
 
+// getFromCache legge dalla cache se la riga non è scaduta rispetto a maxAge. Se il JSON è malformato,
+// la riga viene eliminata e la funzione restituisce false (così il prossimo fetch ripopola la cache).
 func getFromCache(key string, target interface{}, maxAge time.Duration) bool {
 	var data string
 	var timestamp time.Time
@@ -341,16 +355,35 @@ func getFromCache(key string, target interface{}, maxAge time.Duration) bool {
 	}
 
 	err = json.Unmarshal([]byte(data), target)
-	return err == nil
+	if err != nil {
+		debugLog("Corrupted cache for key %s: %v", key, err)
+		if _, delErr := db.Exec("DELETE FROM cache WHERE key = ?", key); delErr != nil {
+			debugLog("Failed to delete corrupted cache for key %s: %v", key, delErr)
+		}
+		return false
+	}
+	return true
 }
 
+// loadFavorites legge il file JSON dei preferiti. Se il file non esiste restituisce nil senza errore;
+// errori di lettura o JSON corrotto vengono loggati in verbose; in caso di unmarshal fallito il file
+// viene rinominato con suffisso .corrupted per evitare loop su dati invalidi.
 func loadFavorites() []pinnedCity {
 	data, err := os.ReadFile(favoritesFile)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			debugLog("Error reading favorites: %v", err)
+		}
 		return nil
 	}
 	var favs []pinnedCity
-	json.Unmarshal(data, &favs)
+	if err := json.Unmarshal(data, &favs); err != nil {
+		debugLog("Corrupted favorites file: %v", err)
+		if renameErr := os.Rename(favoritesFile, favoritesFile+".corrupted"); renameErr != nil {
+			debugLog("Unable to backup corrupted favorites file: %v", renameErr)
+		}
+		return nil
+	}
 	return favs
 }
 
@@ -376,7 +409,8 @@ Task: Recuperare i dati meteorologici correnti per una specifica città.
 Role: Funzione di utilità per l'accesso ai dati esterni (API Open-Meteo).
 Audience: Sviluppatori che lavorano sull'integrazione delle API.
 Context: Utilizzata sia nella modalità interattiva (TUI) che nella modalità CLI rapida.
-Intent: Fornire un'interfaccia unificata e robusta per il recupero dei dati meteo, gestendo context e timeout.
+Intent: Fornire un'interfaccia unificata per il recupero dei dati meteo tramite cache (getFromCache) o HTTP.
+Note: La validità cache è per maxAge; dati corrotti in tabella vengono rimossi in getFromCache.
 
 Parametri:
   - ctx: context.Context per gestire la cancellazione e il timeout della richiesta.
@@ -434,6 +468,40 @@ func getWeather(ctx context.Context, city City) (*WeatherResponse, error) {
 }
 
 /*
+TRACI Docstring - getWeatherWithRetry
+-------------------------------------
+Task: Ottenere il meteo per una città restando resiliente a errori transitori (rete, timeout).
+Role: Wrapper sopra getWeather per la TUI.
+Context: Usa lo stesso ctx per tutti i tentativi; tra un tentativo e l'altro attende con backoff
+
+	(1s, 2s, ...) salvo cancellazione del context.
+
+Intent: Ridurre errori visibili all'utente dopo un singolo fallimento temporaneo.
+*/
+func getWeatherWithRetry(ctx context.Context, city City, maxRetries int) (*WeatherResponse, error) {
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		res, err := getWeather(ctx, city)
+		if err == nil {
+			return res, nil
+		}
+		lastErr = err
+		if i == maxRetries-1 {
+			break
+		}
+
+		delay := time.Duration(i+1) * time.Second
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+			debugLog("Retry %d for city %s after error: %v", i+1, city.Name, err)
+		}
+	}
+	return nil, fmt.Errorf("failed after %d retries: %w", maxRetries, lastErr)
+}
+
+/*
 TRACI Docstring - fetchWeather
 ------------------------------
 Task: Recuperare in modo asincrono i dati meteo di una città.
@@ -442,15 +510,19 @@ Audience: Sviluppatori che lavorano sulla visualizzazione dei dati.
 Context: Chiamata quando l'utente naviga nella lista delle città o seleziona una città.
 Intent: Aggiornare lo stato dell'applicazione con i dati meteorologici correnti (temp, umidità, vento).
 
+Note implementative:
+  - Crea un context con timeout (budget totale per tutti i tentativi) e chiama getWeatherWithRetry
+    con maxRetries=3. La cache valida in getWeather può far completare al primo tentativo senza HTTP.
+
 Valori restituiti:
   - tea.Cmd: Un comando Bubble Tea che restituisce gotWeatherMsg o errMsg.
 */
 func fetchWeather(city City) tea.Cmd {
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
 
-		res, err := getWeather(ctx, city)
+		res, err := getWeatherWithRetry(ctx, city, 3)
 		if err != nil {
 			log.Printf("[ERROR] %v", err)
 			return errMsg(err)
@@ -550,6 +622,32 @@ func fetchCitiesSync(query string) ([]City, error) {
 	return res.Results, nil
 }
 
+// cleanExpiredCache rimuove dalla tabella cache tutte le righe con timestamp più vecchio di 7 giorni.
+// Complementa la scadenza per-chiave gestita da getFromCache (maxAge) e limita la crescita del DB.
+func cleanExpiredCache() {
+	_, err := db.Exec("DELETE FROM cache WHERE timestamp < ?", time.Now().Add(-7*24*time.Hour))
+	if err != nil {
+		debugLog("Cache cleanup failed: %v", err)
+	}
+}
+
+// startCacheCleaner avvia una goroutine che esegue cleanExpiredCache ogni ora finché ctx non viene
+// cancellato (es. uscita da main). Il ticker viene fermato alla conclusione della goroutine.
+func startCacheCleaner(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				cleanExpiredCache()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
 type tickMsg time.Time
 
 /*
@@ -560,6 +658,8 @@ Role: Motore logico dell'applicazione (Elm Architecture).
 Audience: Sviluppatori che lavorano sulla logica dell'applicazione.
 Context: Chiamata ogni volta che si verifica un evento (tasto premuto, risposta API ricevuta).
 Intent: Assicurare che lo stato del modello sia sempre aggiornato in modo deterministico e gestire la logica di debounce della ricerca.
+
+Note: Per tickMsg (auto-refresh), se un ciclo di refresh è ancora in corso (refreshing), il tick viene ignorato e si ripianifica il prossimo tick dopo refreshMin per evitare richieste HTTP sovrapposte.
 
 Parametri:
   - msg: Un valore tea.Msg che può essere un evento di tastiera, un aggiornamento di dimensione finestra o un messaggio personalizzato (gotWeatherMsg, gotCitiesMsg, searchMsg).
@@ -574,14 +674,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
 		if m.refreshMin > 0 {
+			if m.refreshing {
+				debugLog("Skip refresh tick: previous refresh still running")
+				return m, tea.Tick(time.Duration(m.refreshMin)*time.Minute, func(t time.Time) tea.Msg {
+					return tickMsg(t)
+				})
+			}
+
 			var cmds []tea.Cmd
+			jobs := 0
 			// Aggiorna città selezionata
 			if m.selectedCity != nil {
 				cmds = append(cmds, fetchWeather(*m.selectedCity))
+				jobs++
 			}
 			// Aggiorna città monitorate
 			for _, pc := range m.pinnedCities {
 				cmds = append(cmds, fetchWeather(pc.City))
+				jobs++
+			}
+			if jobs > 0 {
+				m.refreshing = true
+				m.refreshJobs = jobs
 			}
 			cmds = append(cmds, tea.Tick(time.Duration(m.refreshMin)*time.Minute, func(t time.Time) tea.Msg {
 				return tickMsg(t)
@@ -663,20 +777,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						City:    *m.selectedCity,
 						Weather: m.weather,
 					})
-					m.statusMsg = getT().Added
-					return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
-						return clearStatusMsg{}
-					})
+					return m, m.withStatus(getT().Added)
 				}
 			}
 			return m, nil
 
 		case tea.KeyCtrlS:
 			saveFavorites(m.pinnedCities)
-			m.statusMsg = getT().Saved
-			return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
-				return clearStatusMsg{}
-			})
+			return m, m.withStatus(getT().Saved)
 		}
 
 		switch msg.String() {
@@ -701,7 +809,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case clearStatusMsg:
-		m.statusMsg = ""
+		if msg.id == m.statusMsgID {
+			m.statusMsg = ""
+		}
 		return m, nil
 
 	case gotCitiesMsg:
@@ -725,6 +835,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case gotWeatherMsg:
 		m.loading = false
+		if m.refreshing && m.refreshJobs > 0 {
+			m.refreshJobs--
+			if m.refreshJobs == 0 {
+				m.refreshing = false
+			}
+		}
 		m.weather = msg.weather
 		m.selectedCity = &msg.city
 		// Update pinned city data if it matches
@@ -738,6 +854,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.err = msg
 		m.loading = false
+		if m.refreshing && m.refreshJobs > 0 {
+			m.refreshJobs--
+			if m.refreshJobs == 0 {
+				m.refreshing = false
+			}
+		}
 		return m, nil
 
 	case tea.WindowSizeMsg:
@@ -764,6 +886,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, cmd
+}
+
+func (m *model) withStatus(msg string) tea.Cmd {
+	m.statusMsgID++
+	currentID := m.statusMsgID
+	m.statusMsg = msg
+	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+		return clearStatusMsg{id: currentID}
+	})
 }
 
 func getWeatherDescription(code int) string {
@@ -1012,9 +1143,15 @@ func main() {
 	listMode := flag.Bool("list", false, "use positional arguments as temporary city list")
 	refreshMin := flag.Int("refresh", 15, "auto-refresh interval in minutes")
 	flag.Parse()
+	if *refreshMin < 0 {
+		*refreshMin = 0
+	}
 
 	initDB()
 	defer db.Close()
+	appCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startCacheCleaner(appCtx)
 
 	// Handle Quick Launch or List Mode
 	if flag.NArg() > 0 {
